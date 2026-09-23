@@ -2,6 +2,7 @@ package com.example.data.preferences
 
 import android.content.Context
 import android.util.Base64
+import android.util.Log
 import androidx.datastore.core.DataStore
 import androidx.datastore.preferences.core.*
 import androidx.datastore.preferences.preferencesDataStore
@@ -29,6 +30,8 @@ class PreferencesManager(private val context: Context) {
     }
 
     companion object {
+        private const val TAG = "PreferencesManager"
+
         val KEY_THEME = stringPreferencesKey("theme_id")
         val KEY_LANGUAGE = stringPreferencesKey("language")
         val KEY_FONT_SIZE = floatPreferencesKey("font_size")
@@ -36,10 +39,12 @@ class PreferencesManager(private val context: Context) {
         val KEY_LETTER_SPACING = floatPreferencesKey("letter_spacing")
         val KEY_AUTOSAVE_ENABLED = booleanPreferencesKey("autosave_enabled")
         val KEY_AUTOSAVE_DEBOUNCE_MS = longPreferencesKey("autosave_debounce_ms")
+        val KEY_GRID_VIEW = booleanPreferencesKey("grid_view_enabled")
+
+        // App Lock keys
         private val APP_LOCK_ENABLED = booleanPreferencesKey("app_lock_enabled")
         private val APP_LOCK_PIN_HASH = stringPreferencesKey("app_lock_pin_hash")
         private val APP_LOCK_PIN_SALT = stringPreferencesKey("app_lock_pin_salt")
-        val KEY_GRID_VIEW = booleanPreferencesKey("grid_view_enabled")
     }
 
     val themeFlow: Flow<String> = dataStore.data
@@ -102,16 +107,16 @@ class PreferencesManager(private val context: Context) {
         .catch { exception ->
             if (exception is IOException) emit(emptyPreferences()) else throw exception
         }
-        .map { 
-            it[APP_LOCK_ENABLED] ?: false 
+        .map {
+            it[APP_LOCK_ENABLED] ?: false
         }
 
     val appLockPinHash: Flow<String?> = dataStore.data
         .catch { exception ->
             if (exception is IOException) emit(emptyPreferences()) else throw exception
         }
-        .map { 
-            it[APP_LOCK_PIN_HASH] 
+        .map {
+            it[APP_LOCK_PIN_HASH]
         }
 
     val appLockEnabledFlow: Flow<Boolean> get() = appLockEnabled
@@ -169,7 +174,7 @@ class PreferencesManager(private val context: Context) {
     }
 
     suspend fun setAppLockEnabled(enabled: Boolean) {
-        dataStore.edit { 
+        dataStore.edit {
             it[APP_LOCK_ENABLED] = enabled
             if (!enabled) {
                 it.remove(APP_LOCK_PIN_HASH)
@@ -178,35 +183,61 @@ class PreferencesManager(private val context: Context) {
         }
     }
 
-    suspend fun setAppLockPin(pin: String) {
-        val salt = generateRandomSalt()
-        val hash = hashPin(pin, salt)
-        dataStore.edit { 
-            it[APP_LOCK_PIN_HASH] = hash
-            it[APP_LOCK_PIN_SALT] = salt
-            it[APP_LOCK_ENABLED] = true
+    suspend fun setAppLockPin(pin: String): Boolean {
+        return try {
+            val saltBytes = ByteArray(16)
+            SecureRandom().nextBytes(saltBytes)
+            val saltBase64 = Base64.encodeToString(saltBytes, Base64.NO_WRAP)
+            val hash = hashPin(pin, saltBase64)
+
+            dataStore.edit {
+                it[APP_LOCK_PIN_HASH] = hash
+                it[APP_LOCK_PIN_SALT] = saltBase64
+                it[APP_LOCK_ENABLED] = true
+            }
+            Log.d(TAG, "setAppLockPin: PIN saved")
+            true
+        } catch (e: Exception) {
+            Log.e(TAG, "setAppLockPin failed", e)
+            false
         }
     }
 
     suspend fun verifyPin(pin: String): Boolean {
-        val prefs = dataStore.data.first()
-        val storedHash = prefs[APP_LOCK_PIN_HASH] ?: return false
-        val salt = prefs[APP_LOCK_PIN_SALT] ?: return false
-        return hashPin(pin, salt) == storedHash
+        return try {
+            val prefs = dataStore.data.first()
+            val storedHash = prefs[APP_LOCK_PIN_HASH]
+            val salt = prefs[APP_LOCK_PIN_SALT]
+
+            Log.d(TAG, "verifyPin: hash=$storedHash salt=$salt")
+
+            if (storedHash.isNullOrEmpty() || salt.isNullOrEmpty()) {
+                Log.w(TAG, "verifyPin: no PIN stored")
+                return false
+            }
+
+            val computed = hashPin(pin, salt)
+            val result = computed == storedHash
+            Log.d(TAG, "verifyPin: computed=$computed result=$result")
+            result
+        } catch (e: Exception) {
+            Log.e(TAG, "verifyPin error", e)
+            false
+        }
     }
 
     private fun hashPin(pin: String, salt: String): String {
         val md = MessageDigest.getInstance("SHA-256")
-        md.update(salt.toByteArray())
-        val bytes = md.digest(pin.toByteArray())
+        md.update(salt.toByteArray(Charsets.UTF_8))
+        val bytes = md.digest(pin.toByteArray(Charsets.UTF_8))
         return Base64.encodeToString(bytes, Base64.NO_WRAP)
     }
 
-    private fun generateRandomSalt(): String {
-        val random = SecureRandom()
-        val bytes = ByteArray(16)
-        random.nextBytes(bytes)
-        return Base64.encodeToString(bytes, Base64.NO_WRAP)
+    fun clearOldPinIfNeeded() {
+        try {
+            val sp = context.getSharedPreferences("app_prefs", Context.MODE_PRIVATE)
+            sp.edit().remove("app_lock_pin").apply()
+        } catch (_: Exception) {}
     }
 
     suspend fun setGridView(enabled: Boolean) {
